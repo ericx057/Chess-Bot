@@ -238,44 +238,33 @@ def is_stalemate(board, color, castling, en_passant):
     moves = generate_moves(board, color, castling, en_passant)
     return len(moves) == 0
 
-def search(board, color, castling, en_passant, depth, alpha, beta, maximizing, node_limit, node_counter):
+def negamax(board, color, castling, en_passant, depth, alpha, beta, node_limit, node_counter):
     if node_counter[0] > node_limit:
-        return evaluate(board)
+        return evaluate(board) * (1 if color == 'white' else -1)
     if depth == 0:
         node_counter[0] += 1
-        return evaluate(board)
+        return evaluate(board) * (1 if color == 'white' else -1)
     moves = generate_moves(board, color, castling, en_passant)
     if not moves:
         if is_in_check(board, color):
-            return -999999 if maximizing else 999999
+            return -999999 * (1 if color == 'white' else -1)
         else:
             return 0
-    if maximizing:
-        value = -9999999
-        for move in moves:
-            b2, c2, ep2 = make_move(copy.deepcopy(board), move, color, castling, en_passant)
-            score = search(b2, opponent(color), c2, ep2, depth - 1, alpha, beta, False, node_limit, node_counter)
-            value = max(value, score)
-            alpha = max(alpha, value)
-            if beta <= alpha:
-                break
-        return value
-    else:
-        value = 9999999
-        for move in moves:
-            b2, c2, ep2 = make_move(copy.deepcopy(board), move, color, castling, en_passant)
-            score = search(b2, opponent(color), c2, ep2, depth - 1, alpha, beta, True, node_limit, node_counter)
-            value = min(value, score)
-            beta = min(beta, value)
-            if beta <= alpha:
-                break
-        return value
+    value = -9999999
+    for move in moves:
+        b2, c2, ep2 = make_move(copy.deepcopy(board), move, color, castling, en_passant)
+        score = -negamax(b2, opponent(color), c2, ep2, depth - 1, -beta, -alpha, node_limit, node_counter)
+        value = max(value, score)
+        alpha = max(alpha, value)
+        if alpha >= beta:
+            break
+    return value
 
 def root_search_worker(args):
     board, move, color, castling, en_passant, depth, node_limit = args
     b2, c2, ep2 = make_move(copy.deepcopy(board), move, color, castling, en_passant)
     node_counter = [0]
-    score = search(b2, opponent(color), c2, ep2, depth - 1, -9999999, 9999999, False, node_limit, node_counter)
+    score = -negamax(b2, opponent(color), c2, ep2, depth - 1, -9999999, 9999999, node_limit, node_counter)
     return (move, score)
 
 def best_move(board, color, castling, en_passant, depth, node_limit=1000000):
@@ -287,8 +276,5 @@ def best_move(board, color, castling, en_passant, depth, node_limit=1000000):
     results = pool.map(root_search_worker, args)
     pool.close()
     pool.join()
-    if color == 'white':
-        best = max(results, key=lambda x: x[1])
-    else:
-        best = min(results, key=lambda x: x[1])
+    best = max(results, key=lambda x: x[1])
     return best[0]
