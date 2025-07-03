@@ -1,6 +1,15 @@
 import copy
 import multiprocessing
-from Functions import evaluate
+import time
+import hashlib
+import random
+from Functions import evaluate, PIECE_VALUES
+
+# Transposition table for memoization
+transposition_table = {}
+TT_EXACT = 0
+TT_LOWER = 1
+TT_UPPER = 2
 
 DIRECTIONS = {
     'N': [(-2, -1), (-2, 1), (2, -1), (2, 1), (-1, -2), (1, -2), (-1, 2), (1, 2)],
@@ -9,6 +18,13 @@ DIRECTIONS = {
     'Q': [(-1, -1), (-1, 1), (1, -1), (1, 1), (-1, 0), (1, 0), (0, -1), (0, 1)],
     'K': [(-1, -1), (-1, 1), (1, -1), (1, 1), (-1, 0), (1, 0), (0, -1), (0, 1)]
 }
+
+# Initialize Zobrist hashing table
+random.seed(42)  # For reproducible results
+zobrist_table = {}
+pieces = ['P', 'N', 'B', 'R', 'Q', 'K', 'p', 'n', 'b', 'r', 'q', 'k']
+for piece in pieces:
+    zobrist_table[piece] = [[random.randint(0, 2**64-1) for _ in range(8)] for _ in range(8)]
 
 def initial_board():
     return [
@@ -239,6 +255,20 @@ def is_stalemate(board, color, castling, en_passant):
     return len(moves) == 0
 
 def negamax(board, color, castling, en_passant, depth, alpha, beta, node_limit, node_counter):
+    # Check transposition table
+    board_hash = hash_board(board)
+    if board_hash in transposition_table:
+        entry = transposition_table[board_hash]
+        if entry['depth'] >= depth:
+            if entry['flag'] == TT_EXACT:
+                return entry['value']
+            elif entry['flag'] == TT_LOWER and entry['value'] > alpha:
+                alpha = entry['value']
+            elif entry['flag'] == TT_UPPER and entry['value'] < beta:
+                beta = entry['value']
+            if alpha >= beta:
+                return alpha
+
     if node_counter[0] > node_limit:
         return evaluate(board) * (1 if color == 'white' else -1)
     if depth == 0:
@@ -251,14 +281,37 @@ def negamax(board, color, castling, en_passant, depth, alpha, beta, node_limit, 
         else:
             return 0
     value = -9999999
-    for move in moves:
+    for move in order_moves(board, moves):
         b2, c2, ep2 = make_move(copy.deepcopy(board), move, color, castling, en_passant)
         score = -negamax(b2, opponent(color), c2, ep2, depth - 1, -beta, -alpha, node_limit, node_counter)
         value = max(value, score)
         alpha = max(alpha, value)
+        # Alpha-beta pruning
         if alpha >= beta:
             break
+
+    # Store in transposition table
+    store_in_transposition_table(board_hash, depth, value, alpha, beta)
+
     return value
+
+def hash_board(board):
+    # Zobrist hashing
+    hash_val = 0
+    for x in range(8):
+        for y in range(8):
+            piece = board[x][y]
+            if piece != '.':
+                hash_val ^= zobrist_table[piece][x][y]
+    return hash_val
+
+def store_in_transposition_table(board_hash, depth, value, alpha, beta):
+    flag = TT_EXACT
+    if value <= alpha:
+        flag = TT_UPPER
+    elif value >= beta:
+        flag = TT_LOWER
+    transposition_table[board_hash] = {'depth': depth, 'value': value, 'flag': flag}
 
 def root_search_worker(args):
     board, move, color, castling, en_passant, depth, node_limit = args
@@ -267,7 +320,55 @@ def root_search_worker(args):
     score = -negamax(b2, opponent(color), c2, ep2, depth - 1, -9999999, 9999999, node_limit, node_counter)
     return (move, score)
 
-def best_move(board, color, castling, en_passant, depth, node_limit=1000000):
+def best_move(board, color, castling, en_passant, max_depth=6, time_limit=5.0):
+    """
+    Find the best move using iterative deepening with time management
+    """
+    moves = generate_moves(board, color, castling, en_passant)
+    if not moves:
+        return None
+
+    start_time = time.time()
+    best_move_found = moves[0]  # Fallback to first legal move
+
+    # Order moves initially for better search
+    moves = order_moves(board, moves)
+
+    for depth in range(1, max_depth + 1):
+        if time.time() - start_time > time_limit:
+            break
+
+        try:
+            # Use single-threaded search for iterative deepening
+            current_best = None
+            current_best_score = -999999
+
+            for move in moves:
+                if time.time() - start_time > time_limit:
+                    break
+
+                b2, c2, ep2 = make_move(copy.deepcopy(board), move, color, castling, en_passant)
+                node_counter = [0]
+                score = -negamax(b2, opponent(color), c2, ep2, depth - 1, -9999999, 9999999,
+                               1000000, node_counter)
+
+                if score > current_best_score:
+                    current_best_score = score
+                    current_best = move
+
+            if current_best:
+                best_move_found = current_best
+
+        except Exception as e:
+            # If we run into issues, return the best move found so far
+            break
+
+    return best_move_found
+
+def best_move_parallel(board, color, castling, en_passant, depth, node_limit=1000000):
+    """
+    Original parallel search for comparison/fallback
+    """
     moves = generate_moves(board, color, castling, en_passant)
     if not moves:
         return None
@@ -278,3 +379,65 @@ def best_move(board, color, castling, en_passant, depth, node_limit=1000000):
     pool.join()
     best = max(results, key=lambda x: x[1])
     return best[0]
+
+def move_value(board, move):
+    """Calculate move value for move ordering (MVV-LVA)"""
+    x1, y1, x2, y2, promo = move
+    attacker = board[x1][y1]
+    victim = board[x2][y2]
+
+    # Most Valuable Victim - Least Valuable Attacker
+    victim_value = PIECE_VALUES.get(victim, 0)
+    attacker_value = PIECE_VALUES.get(attacker, 0)
+
+    score = 0
+    if victim != '.':
+        score += abs(victim_value) * 100 - abs(attacker_value)
+
+    # Bonus for promotions
+    if promo and promo in 'QqRrBbNn':
+        score += 900
+
+    # Bonus for checks (simple heuristic)
+    if move_gives_check(board, move):
+        score += 50
+
+    return score
+
+def move_gives_check(board, move):
+    """Simple check to see if move gives check"""
+    x1, y1, x2, y2, promo = move
+    # This is a simplified check - in practice you'd make the move and test
+    # For now, just return False to avoid complexity
+    return False
+
+def order_moves(board, moves):
+    """Order moves for better alpha-beta pruning"""
+    return sorted(moves, key=lambda move: move_value(board, move), reverse=True)
+
+def quiescence_search(board, color, alpha, beta, depth=0):
+    """Search tactical positions to avoid horizon effect"""
+    if depth > 3:  # Limit quiescence depth
+        return evaluate(board) * (1 if color == 'white' else -1)
+
+    stand_pat = evaluate(board) * (1 if color == 'white' else -1)
+
+    if stand_pat >= beta:
+        return beta
+    if stand_pat > alpha:
+        alpha = stand_pat
+
+    # Generate only captures and checks
+    moves = generate_moves(board, color, None, None)
+    capture_moves = [m for m in moves if board[m[2]][m[3]] != '.']
+
+    for move in order_moves(board, capture_moves):
+        b2, c2, ep2 = make_move(copy.deepcopy(board), move, color, None, None)
+        score = -quiescence_search(b2, opponent(color), -beta, -alpha, depth + 1)
+
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+
+    return alpha
